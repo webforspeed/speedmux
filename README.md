@@ -63,5 +63,6 @@ go run .
 - The app starts with a single pane.
 - Each new pane launches your `$SHELL` (falls back to `/bin/sh`).
 - `MULTIPLEXER_GHOSTTY_VT=0 go run .` disables the ghostty-vt backend and uses the basic line renderer.
+- When enabled, panes prefer `libghostty-vt` by default and automatically fall back to the basic line renderer if a `libghostty` operation fails.
 - `STATS=ON go run .` enables a debug stats row under the help bar (FPS, panes/splits, events, output line counts, and render cell totals).
 - Set `SPEEDMUX_DISABLE_UPDATE_CHECK=1` to skip the update check.

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -154,11 +153,15 @@ func (p *pane) appendOutput(raw []byte) {
 }
 
 func (p *pane) appendOutputWithDelta(raw []byte) int {
-	if p.ghosttyTerm != nil {
-		_ = p.ghosttyTerm.Feed(context.Background(), raw)
-		return bytes.Count(raw, []byte{'\n'})
+	if term := p.getGhosttyTerm(); term != nil {
+		if err := term.Feed(context.Background(), raw); err != nil {
+			p.disableGhostty()
+		}
 	}
+	return p.appendOutputFallbackWithDelta(raw)
+}
 
+func (p *pane) appendOutputFallbackWithDelta(raw []byte) int {
 	clean := ansiEscape.ReplaceAllString(string(raw), "")
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -223,10 +226,16 @@ func (p *pane) visibleLinesWithScroll(width, height, scroll int) ([]string, int)
 		return nil, 0
 	}
 
-	if p.ghosttyTerm != nil {
-		return p.visibleLinesGhostty(width, height, scroll)
+	if term := p.getGhosttyTerm(); term != nil {
+		if lines, clamped, ok := p.visibleLinesGhostty(term, height, scroll); ok {
+			return lines, clamped
+		}
 	}
 
+	return p.visibleLinesFallback(width, height, scroll)
+}
+
+func (p *pane) visibleLinesFallback(width, height, scroll int) ([]string, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -237,17 +246,23 @@ func (p *pane) visibleLinesWithScroll(width, height, scroll int) ([]string, int)
 	return windowLines(all, width, height, scroll)
 }
 
-func (p *pane) visibleLinesGhostty(width, height, scroll int) ([]string, int) {
-	dump, err := p.ghosttyTerm.DumpScreen(context.Background(), libghostty.DumpVTSafe|libghostty.DumpFlagUnwrap|libghostty.DumpFlagScrollback)
+func (p *pane) visibleLinesGhostty(term *libghostty.Terminal, height, scroll int) ([]string, int, bool) {
+	dump, err := term.DumpScreen(context.Background(), libghostty.DumpVTSafe|libghostty.DumpFlagUnwrap|libghostty.DumpFlagScrollback)
 	if err != nil {
-		return []string{truncateRunes("[ghostty-vt dump error]", width)}, 0
+		p.disableGhostty()
+		return nil, 0, false
 	}
 
 	normalized := strings.ReplaceAll(string(dump.VT), "\r\n", "\n")
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")
 	lines := strings.Split(normalized, "\n")
 
-	return windowLinesNoTruncate(lines, height, scroll)
+	if dump.IsAltScreen {
+		scroll = 0
+	}
+
+	clampedLines, clampedScroll := windowLinesNoTruncate(lines, height, scroll)
+	return clampedLines, clampedScroll, true
 }
 
 func windowLines(all []string, width, height, scroll int) ([]string, int) {
@@ -322,14 +337,16 @@ func (p *pane) resize(cols, rows int) {
 		return
 	}
 	_ = pty.Setsize(p.pty, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-	if p.ghosttyTerm != nil {
-		_ = p.ghosttyTerm.Resize(context.Background(), uint32(cols), uint32(rows))
+	if term := p.getGhosttyTerm(); term != nil {
+		if err := term.Resize(context.Background(), uint32(cols), uint32(rows)); err != nil {
+			p.disableGhostty()
+		}
 	}
 }
 
 func (p *pane) close() {
-	if p.ghosttyTerm != nil {
-		_ = p.ghosttyTerm.Close(context.Background())
+	if term := p.detachGhostty(); term != nil {
+		_ = term.Close(context.Background())
 	}
 	if p.pty != nil {
 		_ = p.pty.Close()
@@ -365,8 +382,8 @@ func (p *pane) cwd() string {
 	if cwd := strings.TrimSpace(p.trackedDir); cwd != "" {
 		return cwd
 	}
-	if p.ghosttyTerm != nil {
-		if pwd := strings.TrimSpace(p.ghosttyTerm.GetPwd(context.Background())); pwd != "" {
+	if term := p.getGhosttyTerm(); term != nil {
+		if pwd := strings.TrimSpace(term.GetPwd(context.Background())); pwd != "" {
 			return pwd
 		}
 	}
@@ -1953,7 +1970,11 @@ func (p *pane) writeKey(k *tcell.EventKey) {
 }
 
 func (p *pane) encodeKeyGhostty(k *tcell.EventKey) ([]byte, bool) {
-	if p.ghosttyTerm == nil || k == nil {
+	if k == nil {
+		return nil, false
+	}
+	term := p.getGhosttyTerm()
+	if term == nil {
 		return nil, false
 	}
 
@@ -1962,11 +1983,35 @@ func (p *pane) encodeKeyGhostty(k *tcell.EventKey) ([]byte, bool) {
 		return nil, false
 	}
 
-	data, err := p.ghosttyTerm.EncodeKey(context.Background(), keyCode, mods)
-	if err != nil || len(data) == 0 {
+	data, err := term.EncodeKey(context.Background(), keyCode, mods)
+	if err != nil {
+		p.disableGhostty()
+		return nil, false
+	}
+	if len(data) == 0 {
 		return nil, false
 	}
 	return data, true
+}
+
+func (p *pane) getGhosttyTerm() *libghostty.Terminal {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ghosttyTerm
+}
+
+func (p *pane) detachGhostty() *libghostty.Terminal {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	term := p.ghosttyTerm
+	p.ghosttyTerm = nil
+	return term
+}
+
+func (p *pane) disableGhostty() {
+	if term := p.detachGhostty(); term != nil {
+		_ = term.Close(context.Background())
+	}
 }
 
 func tcellToGhosttyKey(k *tcell.EventKey) (libghostty.KeyCode, libghostty.Modifier, bool) {

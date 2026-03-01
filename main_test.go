@@ -775,6 +775,72 @@ func TestVisibleLinesWithScroll_AppliesOffsetAndClamp(t *testing.T) {
 	}
 }
 
+func TestAppendOutputWithDelta_GhosttyFeedFailureFallsBack(t *testing.T) {
+	ctx := t.Context()
+	rt, err := libghostty.NewRuntime(ctx)
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	defer rt.Close()
+
+	term, err := rt.NewTerminal(ctx, 80, 24, maxScrollbackLines)
+	if err != nil {
+		t.Fatalf("new terminal: %v", err)
+	}
+	if err := term.Close(ctx); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+
+	p := &pane{
+		ghosttyTerm: term,
+		lines:       make([]string, 0, 4),
+	}
+	added := p.appendOutputWithDelta([]byte("hello\n"))
+	if got, want := added, 1; got != want {
+		t.Fatalf("lines added: got %d want %d", got, want)
+	}
+	if p.getGhosttyTerm() != nil {
+		t.Fatal("expected ghostty terminal to be disabled after feed failure")
+	}
+	if got, want := p.lines, []string{"hello"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fallback lines: got %#v want %#v", got, want)
+	}
+}
+
+func TestVisibleLinesWithScroll_GhosttyDumpFailureFallsBack(t *testing.T) {
+	ctx := t.Context()
+	rt, err := libghostty.NewRuntime(ctx)
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	defer rt.Close()
+
+	term, err := rt.NewTerminal(ctx, 80, 24, maxScrollbackLines)
+	if err != nil {
+		t.Fatalf("new terminal: %v", err)
+	}
+	if err := term.Close(ctx); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+
+	p := &pane{
+		ghosttyTerm: term,
+		lines:       []string{"l1", "l2"},
+		curr:        []rune("l3"),
+	}
+
+	lines, scroll := p.visibleLinesWithScroll(10, 2, 0)
+	if got, want := scroll, 0; got != want {
+		t.Fatalf("scroll: got %d want %d", got, want)
+	}
+	if got, want := lines, []string{"l2", "l3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("visible lines fallback: got %#v want %#v", got, want)
+	}
+	if p.getGhosttyTerm() != nil {
+		t.Fatal("expected ghostty terminal to be disabled after dump failure")
+	}
+}
+
 func TestKeyToBytes_Mappings(t *testing.T) {
 	tests := []struct {
 		name string
