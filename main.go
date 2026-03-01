@@ -26,6 +26,7 @@ const (
 	sidebarMaxWidth    = 56
 	minPaneAreaWidth   = 36
 	sidebarCardHeight  = 5
+	sidebarCardGap     = 1
 	processPollEvery   = 400 * time.Millisecond
 )
 
@@ -1230,24 +1231,38 @@ func (a *app) drawSidebar(r rect) {
 	}
 
 	summaries := a.paneSummaries()
-	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight)
+	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight, sidebarCardGap)
+	stride := sidebarCardHeight + sidebarCardGap
 	for i := 0; i < visible; i++ {
 		item := summaries[i]
 		cardRect := rect{
 			x: r.x + 1,
-			y: r.y + 1 + (i * sidebarCardHeight),
+			y: r.y + 1 + (i * stride),
 			w: innerW,
 			h: sidebarCardHeight,
 		}
 		a.drawSidebarCard(cardRect, item, item.node == a.active)
+		if i < visible-1 {
+			a.drawSidebarDivider(r.x+1, cardRect.y+sidebarCardHeight, innerW)
+		}
 	}
 
 	if visible < len(summaries) {
-		y := r.y + 1 + (visible * sidebarCardHeight)
+		y := r.y + 1 + (visible * stride)
 		if y < r.y+r.h-1 {
 			remaining := len(summaries) - visible
 			drawText(a.screen, r.x+1, y, innerW, fmt.Sprintf("... +%d more", remaining), tcell.StyleDefault.Foreground(tcell.ColorAqua))
 		}
+	}
+}
+
+func (a *app) drawSidebarDivider(x, y, width int) {
+	if width <= 0 {
+		return
+	}
+	style := tcell.StyleDefault.Foreground(tcell.ColorTeal)
+	for i := 0; i < width; i++ {
+		a.screen.SetContent(x+i, y, tcell.RuneHLine, nil, style)
 	}
 }
 
@@ -1266,16 +1281,17 @@ func (a *app) drawSidebarCard(r rect, item paneSummary, active bool) {
 	if active {
 		marker = ">"
 	}
+	bodyPrefix := "  "
 	pid := "-"
 	if item.pid > 0 {
 		pid = fmt.Sprintf("%d", item.pid)
 	}
 
 	drawText(a.screen, r.x, r.y, r.w, fmt.Sprintf("%s pane:%d pid:%s", marker, item.id, pid), headerStyle)
-	drawText(a.screen, r.x, r.y+1, r.w, fmt.Sprintf("cmd:%s", item.cmd), bodyStyle)
-	drawText(a.screen, r.x, r.y+2, r.w, fmt.Sprintf("cwd:%s", tailEllipsis(item.cwd, r.w-4)), bodyStyle)
-	drawText(a.screen, r.x, r.y+3, r.w, fmt.Sprintf("cpu:%s mem:%s rss:%s", item.cpu, item.mem, item.rss), bodyStyle.Foreground(tcell.ColorSilver))
-	drawText(a.screen, r.x, r.y+4, r.w, fmt.Sprintf("st:%s et:%s", item.state, item.elapsed), bodyStyle.Foreground(tcell.ColorSilver))
+	drawText(a.screen, r.x, r.y+1, r.w, fmt.Sprintf("%scmd:%s", bodyPrefix, item.cmd), bodyStyle)
+	drawText(a.screen, r.x, r.y+2, r.w, fmt.Sprintf("%scwd:%s", bodyPrefix, tailEllipsis(item.cwd, r.w-6)), bodyStyle)
+	drawText(a.screen, r.x, r.y+3, r.w, fmt.Sprintf("%scpu:%s mem:%s rss:%s", bodyPrefix, item.cpu, item.mem, item.rss), bodyStyle.Foreground(tcell.ColorSilver))
+	drawText(a.screen, r.x, r.y+4, r.w, fmt.Sprintf("%sst:%s et:%s", bodyPrefix, item.state, item.elapsed), bodyStyle.Foreground(tcell.ColorSilver))
 }
 
 func (a *app) paneSummaries() []paneSummary {
@@ -1338,27 +1354,23 @@ func (a *app) paneSummaries() []paneSummary {
 	return out
 }
 
-func sidebarVisibleItems(innerHeight, total, cardHeight int) int {
-	if innerHeight <= 0 || total <= 0 || cardHeight <= 0 {
+func sidebarVisibleItems(innerHeight, total, cardHeight, gap int) int {
+	if innerHeight <= 0 || total <= 0 || cardHeight <= 0 || gap < 0 {
 		return 0
 	}
 
-	maxCards := innerHeight / cardHeight
-	if maxCards <= 0 {
-		return 0
+	best := 0
+	for v := 1; v <= total; v++ {
+		used := v*cardHeight + (v-1)*gap
+		if v < total {
+			used++ // one row for the "... +N more" marker
+		}
+		if used > innerHeight {
+			break
+		}
+		best = v
 	}
-
-	if total <= maxCards {
-		return total
-	}
-
-	if innerHeight-maxCards*cardHeight >= 1 {
-		return maxCards
-	}
-	if maxCards == 1 {
-		return 0
-	}
-	return maxCards - 1
+	return best
 }
 
 func (a *app) sidebarPaneAt(x, y int) *node {
@@ -1374,12 +1386,15 @@ func (a *app) sidebarPaneAt(x, y int) *node {
 	row := y - (r.y + 1)
 	innerH := r.h - 2
 	summaries := a.paneSummaries()
-	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight)
-	if row < 0 || row >= visible*sidebarCardHeight {
-		return nil
+	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight, sidebarCardGap)
+	stride := sidebarCardHeight + sidebarCardGap
+	for i := 0; i < visible; i++ {
+		start := i * stride
+		if row >= start && row < start+sidebarCardHeight {
+			return summaries[i].node
+		}
 	}
-	idx := row / sidebarCardHeight
-	return summaries[idx].node
+	return nil
 }
 
 func (a *app) sidebarWidth(totalWidth int) int {

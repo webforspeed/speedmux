@@ -209,21 +209,24 @@ func TestSidebarVisibleItems(t *testing.T) {
 		innerH     int
 		totalPanes int
 		cardH      int
+		gap        int
 		want       int
 	}{
-		{name: "no room", innerH: 0, totalPanes: 5, cardH: 5, want: 0},
-		{name: "no panes", innerH: 20, totalPanes: 0, cardH: 5, want: 0},
-		{name: "fits all panes", innerH: 20, totalPanes: 3, cardH: 5, want: 3},
-		{name: "exactly full with overflow reserves one card", innerH: 20, totalPanes: 9, cardH: 5, want: 3},
-		{name: "overflow with spare line keeps max cards", innerH: 21, totalPanes: 9, cardH: 5, want: 4},
-		{name: "invalid card height", innerH: 20, totalPanes: 2, cardH: 0, want: 0},
+		{name: "no room", innerH: 0, totalPanes: 5, cardH: 5, gap: 1, want: 0},
+		{name: "no panes", innerH: 20, totalPanes: 0, cardH: 5, gap: 1, want: 0},
+		{name: "fits all panes", innerH: 20, totalPanes: 3, cardH: 5, gap: 1, want: 3},
+		{name: "exactly full with overflow reserves one card", innerH: 20, totalPanes: 9, cardH: 5, gap: 1, want: 3},
+		{name: "overflow at 21 still capped due to gaps", innerH: 21, totalPanes: 9, cardH: 5, gap: 1, want: 3},
+		{name: "four cards fit with overflow marker", innerH: 24, totalPanes: 9, cardH: 5, gap: 1, want: 4},
+		{name: "invalid card height", innerH: 20, totalPanes: 2, cardH: 0, gap: 1, want: 0},
+		{name: "invalid negative gap", innerH: 20, totalPanes: 2, cardH: 5, gap: -1, want: 0},
 	}
 
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sidebarVisibleItems(tc.innerH, tc.totalPanes, tc.cardH); got != tc.want {
-				t.Fatalf("sidebarVisibleItems(%d, %d, %d): got %d want %d", tc.innerH, tc.totalPanes, tc.cardH, got, tc.want)
+			if got := sidebarVisibleItems(tc.innerH, tc.totalPanes, tc.cardH, tc.gap); got != tc.want {
+				t.Fatalf("sidebarVisibleItems(%d, %d, %d, %d): got %d want %d", tc.innerH, tc.totalPanes, tc.cardH, tc.gap, got, tc.want)
 			}
 		})
 	}
