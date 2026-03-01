@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,11 @@ import (
 const (
 	maxScrollbackLines = 2000
 	mouseScrollStep    = 3
+	sidebarMinWidth    = 30
+	sidebarMaxWidth    = 56
+	minPaneAreaWidth   = 36
+	sidebarCardHeight  = 5
+	processPollEvery   = 400 * time.Millisecond
 )
 
 type splitOrientation int
@@ -43,6 +49,9 @@ type pane struct {
 	cmd         *exec.Cmd
 	pty         *os.File
 	ghosttyTerm *libghostty.Terminal
+	startDir    string
+	lastCmd     string
+	inputLine   []rune
 	mu          sync.Mutex
 	lines       []string
 	curr        []rune
@@ -51,6 +60,7 @@ type pane struct {
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\a]*(?:\a|\x1b\\)|\x1b[@-Z\\-_]`)
+var envAssignPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
 func newPane(id int, redraw func(), ghosttyRuntime *libghostty.Runtime, onOutput func(lines int)) (*pane, error) {
 	shell := os.Getenv("SHELL")
@@ -59,6 +69,10 @@ func newPane(id int, redraw func(), ghosttyRuntime *libghostty.Runtime, onOutput
 	}
 
 	cmd := newShellCommand(shell)
+	startDir, _ := os.Getwd()
+	if startDir != "" {
+		cmd.Dir = startDir
+	}
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
 
 	ptmx, err := pty.Start(cmd)
@@ -66,7 +80,7 @@ func newPane(id int, redraw func(), ghosttyRuntime *libghostty.Runtime, onOutput
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 
-	p := &pane{id: id, cmd: cmd, pty: ptmx, lines: make([]string, 0, 128), onOutput: onOutput}
+	p := &pane{id: id, cmd: cmd, pty: ptmx, startDir: startDir, lines: make([]string, 0, 128), onOutput: onOutput}
 	if ghosttyRuntime != nil {
 		term, err := ghosttyRuntime.NewTerminal(context.Background(), 80, 24, maxScrollbackLines)
 		if err == nil {
@@ -275,6 +289,344 @@ func (p *pane) close() {
 	}
 }
 
+func (p *pane) pid() int {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
+	return p.cmd.Process.Pid
+}
+
+func (p *pane) commandName() string {
+	if p == nil || p.cmd == nil {
+		return "-"
+	}
+	name := filepath.Base(strings.TrimSpace(p.cmd.Path))
+	if name == "" {
+		return "-"
+	}
+	return name
+}
+
+func (p *pane) cwd() string {
+	if p == nil {
+		return "-"
+	}
+	if p.ghosttyTerm != nil {
+		if pwd := strings.TrimSpace(p.ghosttyTerm.GetPwd(context.Background())); pwd != "" {
+			return pwd
+		}
+	}
+	if cwd := strings.TrimSpace(p.startDir); cwd != "" {
+		return cwd
+	}
+	if p.cmd != nil {
+		if cwd := strings.TrimSpace(p.cmd.Dir); cwd != "" {
+			return cwd
+		}
+	}
+	return "-"
+}
+
+func isShellName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "sh", "bash", "zsh", "ksh", "mksh", "dash", "fish", "yash":
+		return true
+	default:
+		return false
+	}
+}
+
+func processCommandName(command string) string {
+	name := filepath.Base(strings.TrimSpace(command))
+	name = strings.TrimSpace(strings.Trim(name, "()"))
+	name = strings.TrimPrefix(name, "-")
+	if name == "" {
+		return "-"
+	}
+	return name
+}
+
+func isIgnoredHelperCommand(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "path_helper", "login":
+		return true
+	default:
+		return false
+	}
+}
+
+func commandFromInputLine(line string) string {
+	tokens := tokenizeInputLine(line)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	for len(tokens) > 0 {
+		tok := tokens[0]
+		if envAssignPattern.MatchString(tok) {
+			tokens = tokens[1:]
+			continue
+		}
+		break
+	}
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	// Peel common wrappers and their flags.
+	for len(tokens) > 0 {
+		switch tokens[0] {
+		case "sudo", "env", "command", "builtin", "nohup", "time", "exec":
+			tokens = tokens[1:]
+			for len(tokens) > 0 && strings.HasPrefix(tokens[0], "-") {
+				tokens = tokens[1:]
+			}
+		default:
+			goto done
+		}
+	}
+
+done:
+	if len(tokens) == 0 {
+		return ""
+	}
+	cmd := processCommandName(tokens[0])
+	if cmd == "-" {
+		return ""
+	}
+	return cmd
+}
+
+func tokenizeInputLine(line string) []string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+
+	tokens := make([]string, 0, 8)
+	var cur []rune
+	var quote rune
+	escaped := false
+
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		tokens = append(tokens, string(cur))
+		cur = cur[:0]
+	}
+
+	for _, r := range line {
+		if escaped {
+			cur = append(cur, r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				cur = append(cur, r)
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"', '`':
+			quote = r
+		case ' ', '\t':
+			flush()
+		case '|', ';', '&':
+			flush()
+			return tokens
+		default:
+			cur = append(cur, r)
+		}
+	}
+	flush()
+	return tokens
+}
+
+func parseProcessLine(line string) (processInfo, bool) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 8 {
+		return processInfo{}, false
+	}
+
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return processInfo{}, false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil || ppid < 0 {
+		return processInfo{}, false
+	}
+	pcpu, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		pcpu = 0
+	}
+	pmem, err := strconv.ParseFloat(fields[3], 64)
+	if err != nil {
+		pmem = 0
+	}
+	rss, err := strconv.ParseInt(fields[4], 10, 64)
+	if err != nil {
+		rss = 0
+	}
+
+	return processInfo{
+		pid:     pid,
+		ppid:    ppid,
+		pcpu:    pcpu,
+		pmem:    pmem,
+		rssKB:   rss,
+		state:   fields[5],
+		elapsed: fields[6],
+		command: strings.Join(fields[7:], " "),
+	}, true
+}
+
+func collectProcessSnapshot() (processSnapshot, error) {
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,pcpu=,pmem=,rss=,stat=,etime=,comm=").Output()
+	if err != nil {
+		return processSnapshot{}, err
+	}
+
+	snap := processSnapshot{
+		byPID:    make(map[int]processInfo, 256),
+		children: make(map[int][]int, 256),
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		info, ok := parseProcessLine(line)
+		if !ok {
+			continue
+		}
+		snap.byPID[info.pid] = info
+		snap.children[info.ppid] = append(snap.children[info.ppid], info.pid)
+	}
+	return snap, nil
+}
+
+func (a *app) refreshProcessSnapshot(now time.Time) {
+	if !a.procUpdatedAt.IsZero() && now.Sub(a.procUpdatedAt) < processPollEvery {
+		return
+	}
+	a.procUpdatedAt = now
+	snap, err := collectProcessSnapshot()
+	if err != nil {
+		return
+	}
+	a.procSnapshot = snap
+}
+
+func descendantPIDs(children map[int][]int, root int) []int {
+	if root <= 0 {
+		return nil
+	}
+
+	stack := append([]int(nil), children[root]...)
+	out := make([]int, 0, len(stack))
+	seen := make(map[int]struct{}, len(stack))
+	for len(stack) > 0 {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, exists := seen[pid]; exists {
+			continue
+		}
+		seen[pid] = struct{}{}
+		out = append(out, pid)
+		stack = append(stack, children[pid]...)
+	}
+	return out
+}
+
+func processScore(info processInfo, shellPID int) int {
+	score := 0
+	if info.pid != shellPID {
+		score += 10
+	}
+	cmd := processCommandName(info.command)
+	if !isShellName(cmd) {
+		score += 20
+	}
+	if isIgnoredHelperCommand(cmd) {
+		score -= 25
+	}
+	if strings.Contains(info.state, "Z") {
+		score -= 100
+	}
+	if strings.HasPrefix(info.state, "T") {
+		score -= 5
+	}
+	return score
+}
+
+func (a *app) processForPane(p *pane) (processInfo, bool) {
+	if p == nil {
+		return processInfo{}, false
+	}
+
+	shellPID := p.pid()
+	if shellPID <= 0 || len(a.procSnapshot.byPID) == 0 {
+		return processInfo{}, false
+	}
+
+	shell, ok := a.procSnapshot.byPID[shellPID]
+	if !ok {
+		return processInfo{}, false
+	}
+
+	best := shell
+	bestScore := processScore(shell, shellPID)
+	for _, pid := range descendantPIDs(a.procSnapshot.children, shellPID) {
+		info, ok := a.procSnapshot.byPID[pid]
+		if !ok {
+			continue
+		}
+		score := processScore(info, shellPID)
+		if score > bestScore || (score == bestScore && info.pid > best.pid) {
+			best = info
+			bestScore = score
+		}
+	}
+
+	return best, true
+}
+
+func formatPercent(pct float64) string {
+	return fmt.Sprintf("%.1f%%", pct)
+}
+
+func formatRSSKB(kb int64) string {
+	if kb <= 0 {
+		return "-"
+	}
+	if kb >= 1024*1024 {
+		return fmt.Sprintf("%.1fG", float64(kb)/(1024*1024))
+	}
+	if kb >= 1024 {
+		return fmt.Sprintf("%.1fM", float64(kb)/1024)
+	}
+	return fmt.Sprintf("%dK", kb)
+}
+
+func tailEllipsis(in string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	r := []rune(strings.TrimSpace(in))
+	if len(r) <= width {
+		return string(r)
+	}
+	if width <= 3 {
+		return string(r[len(r)-width:])
+	}
+	return "..." + string(r[len(r)-width+3:])
+}
+
 type node struct {
 	parent      *node
 	orientation splitOrientation
@@ -373,6 +725,8 @@ type app struct {
 	paneScroll     map[int]int
 	outputCh       chan paneOutput
 	redrawCh       chan struct{}
+	procSnapshot   processSnapshot
+	procUpdatedAt  time.Time
 	quitting       bool
 	statsEnabled   bool
 	renderCount    uint64
@@ -390,6 +744,35 @@ type app struct {
 type paneOutput struct {
 	paneID int
 	lines  int
+}
+
+type paneSummary struct {
+	node    *node
+	id      int
+	pid     int
+	cmd     string
+	cwd     string
+	cpu     string
+	mem     string
+	rss     string
+	state   string
+	elapsed string
+}
+
+type processSnapshot struct {
+	byPID    map[int]processInfo
+	children map[int][]int
+}
+
+type processInfo struct {
+	pid     int
+	ppid    int
+	pcpu    float64
+	pmem    float64
+	rssKB   int64
+	state   string
+	elapsed string
+	command string
 }
 
 func newApp() (*app, error) {
@@ -555,8 +938,14 @@ func (a *app) handleShortcut(k *tcell.EventKey) bool {
 func (a *app) handleMouse(m *tcell.EventMouse) bool {
 	btn := m.Buttons()
 	x, y := m.Position()
+	sidebarTarget := a.sidebarPaneAt(x, y)
 	target := a.paneAt(x, y)
 	changed := false
+
+	if sidebarTarget != nil && btn&tcell.Button1 != 0 && sidebarTarget != a.active {
+		a.active = sidebarTarget
+		changed = true
+	}
 
 	if target != nil && btn&tcell.Button1 != 0 && target != a.active {
 		a.active = target
@@ -586,11 +975,10 @@ func (a *app) handleMouse(m *tcell.EventMouse) bool {
 
 func (a *app) paneAt(x, y int) *node {
 	sw, sh := a.screen.Size()
-	topRows := a.topBarRows()
-	if x < 0 || y < topRows || x >= sw || y >= sh || a.root == nil || sh <= topRows {
+	layoutRegion := a.paneRegion(sw, sh)
+	if x < 0 || y < 0 || x >= sw || y >= sh || a.root == nil || layoutRegion.w <= 0 || layoutRegion.h <= 0 {
 		return nil
 	}
-	layoutRegion := rect{x: 0, y: topRows, w: sw, h: sh - topRows}
 	var hit *node
 	a.root.layout(layoutRegion, func(n *node, r rect) {
 		if hit != nil {
@@ -771,7 +1159,18 @@ func (a *app) render() {
 		return
 	}
 
-	layoutRegion := rect{x: 0, y: topRows, w: sw, h: sh - topRows}
+	a.refreshProcessSnapshot(time.Now())
+
+	sidebarRegion := a.sidebarRegion(sw, sh)
+	if sidebarRegion.w > 0 && sidebarRegion.h > 0 {
+		a.drawSidebar(sidebarRegion)
+	}
+
+	layoutRegion := a.paneRegion(sw, sh)
+	if layoutRegion.w <= 0 || layoutRegion.h <= 0 {
+		a.screen.Show()
+		return
+	}
 	a.root.layout(layoutRegion, func(n *node, r rect) {
 		a.drawPane(n, r)
 	})
@@ -813,6 +1212,213 @@ func (a *app) drawPane(n *node, r rect) {
 		}
 		drawText(a.screen, r.x+1, y, innerW, line, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 	}
+}
+
+func (a *app) drawSidebar(r rect) {
+	if r.w <= 0 || r.h <= 0 {
+		return
+	}
+
+	borderStyle := tcell.StyleDefault.Foreground(tcell.ColorTeal)
+	drawBox(a.screen, r, borderStyle)
+	drawText(a.screen, r.x+2, r.y, r.w-4, " panes ", borderStyle)
+
+	innerW := r.w - 2
+	innerH := r.h - 2
+	if innerW <= 0 || innerH <= 0 {
+		return
+	}
+
+	summaries := a.paneSummaries()
+	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight)
+	for i := 0; i < visible; i++ {
+		item := summaries[i]
+		cardRect := rect{
+			x: r.x + 1,
+			y: r.y + 1 + (i * sidebarCardHeight),
+			w: innerW,
+			h: sidebarCardHeight,
+		}
+		a.drawSidebarCard(cardRect, item, item.node == a.active)
+	}
+
+	if visible < len(summaries) {
+		y := r.y + 1 + (visible * sidebarCardHeight)
+		if y < r.y+r.h-1 {
+			remaining := len(summaries) - visible
+			drawText(a.screen, r.x+1, y, innerW, fmt.Sprintf("... +%d more", remaining), tcell.StyleDefault.Foreground(tcell.ColorAqua))
+		}
+	}
+}
+
+func (a *app) drawSidebarCard(r rect, item paneSummary, active bool) {
+	if r.w <= 0 || r.h < sidebarCardHeight {
+		return
+	}
+
+	headerStyle := tcell.StyleDefault.Foreground(tcell.ColorSilver)
+	bodyStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+	if active {
+		headerStyle = tcell.StyleDefault.Foreground(tcell.ColorYellow)
+	}
+
+	marker := " "
+	if active {
+		marker = ">"
+	}
+	pid := "-"
+	if item.pid > 0 {
+		pid = fmt.Sprintf("%d", item.pid)
+	}
+
+	drawText(a.screen, r.x, r.y, r.w, fmt.Sprintf("%s pane:%d pid:%s", marker, item.id, pid), headerStyle)
+	drawText(a.screen, r.x, r.y+1, r.w, fmt.Sprintf("cmd:%s", item.cmd), bodyStyle)
+	drawText(a.screen, r.x, r.y+2, r.w, fmt.Sprintf("cwd:%s", tailEllipsis(item.cwd, r.w-4)), bodyStyle)
+	drawText(a.screen, r.x, r.y+3, r.w, fmt.Sprintf("cpu:%s mem:%s rss:%s", item.cpu, item.mem, item.rss), bodyStyle.Foreground(tcell.ColorSilver))
+	drawText(a.screen, r.x, r.y+4, r.w, fmt.Sprintf("st:%s et:%s", item.state, item.elapsed), bodyStyle.Foreground(tcell.ColorSilver))
+}
+
+func (a *app) paneSummaries() []paneSummary {
+	if a.root == nil {
+		return nil
+	}
+
+	var leaves []*node
+	a.root.walkLeaves(&leaves)
+	if len(leaves) == 0 {
+		return nil
+	}
+
+	out := make([]paneSummary, 0, len(leaves))
+	for _, n := range leaves {
+		if n == nil || n.pane == nil {
+			continue
+		}
+
+		p := n.pane
+		cmd := p.commandName()
+		if p.lastCmd != "" {
+			cmd = p.lastCmd
+		}
+		cpu := "-"
+		mem := "-"
+		rss := "-"
+		state := "n/a"
+		elapsed := "-"
+
+		if proc, ok := a.processForPane(p); ok {
+			liveCmd := processCommandName(proc.command)
+			if p.lastCmd == "" && liveCmd != "-" && !isShellName(liveCmd) && !isIgnoredHelperCommand(liveCmd) {
+				cmd = liveCmd
+			}
+			cpu = formatPercent(proc.pcpu)
+			mem = formatPercent(proc.pmem)
+			rss = formatRSSKB(proc.rssKB)
+			if strings.TrimSpace(proc.state) != "" {
+				state = proc.state
+			}
+			if strings.TrimSpace(proc.elapsed) != "" {
+				elapsed = proc.elapsed
+			}
+		}
+
+		out = append(out, paneSummary{
+			node:    n,
+			id:      p.id,
+			pid:     p.pid(),
+			cmd:     cmd,
+			cwd:     p.cwd(),
+			cpu:     cpu,
+			mem:     mem,
+			rss:     rss,
+			state:   state,
+			elapsed: elapsed,
+		})
+	}
+	return out
+}
+
+func sidebarVisibleItems(innerHeight, total, cardHeight int) int {
+	if innerHeight <= 0 || total <= 0 || cardHeight <= 0 {
+		return 0
+	}
+
+	maxCards := innerHeight / cardHeight
+	if maxCards <= 0 {
+		return 0
+	}
+
+	if total <= maxCards {
+		return total
+	}
+
+	if innerHeight-maxCards*cardHeight >= 1 {
+		return maxCards
+	}
+	if maxCards == 1 {
+		return 0
+	}
+	return maxCards - 1
+}
+
+func (a *app) sidebarPaneAt(x, y int) *node {
+	sw, sh := a.screen.Size()
+	r := a.sidebarRegion(sw, sh)
+	if r.w <= 0 || r.h <= 0 {
+		return nil
+	}
+	if x < r.x+1 || x >= r.x+r.w-1 || y < r.y+1 || y >= r.y+r.h-1 {
+		return nil
+	}
+
+	row := y - (r.y + 1)
+	innerH := r.h - 2
+	summaries := a.paneSummaries()
+	visible := sidebarVisibleItems(innerH, len(summaries), sidebarCardHeight)
+	if row < 0 || row >= visible*sidebarCardHeight {
+		return nil
+	}
+	idx := row / sidebarCardHeight
+	return summaries[idx].node
+}
+
+func (a *app) sidebarWidth(totalWidth int) int {
+	if totalWidth <= 0 {
+		return 0
+	}
+
+	width := totalWidth / 4
+	if width < sidebarMinWidth {
+		width = sidebarMinWidth
+	}
+	if width > sidebarMaxWidth {
+		width = sidebarMaxWidth
+	}
+	if totalWidth-width < minPaneAreaWidth {
+		return 0
+	}
+	return width
+}
+
+func (a *app) sidebarRegion(sw, sh int) rect {
+	topRows := a.topBarRows()
+	if sh <= topRows {
+		return rect{}
+	}
+	sidebarW := a.sidebarWidth(sw)
+	if sidebarW <= 0 {
+		return rect{}
+	}
+	return rect{x: 0, y: topRows, w: sidebarW, h: sh - topRows}
+}
+
+func (a *app) paneRegion(sw, sh int) rect {
+	topRows := a.topBarRows()
+	if sh <= topRows {
+		return rect{}
+	}
+	sidebarW := a.sidebarWidth(sw)
+	return rect{x: sidebarW, y: topRows, w: sw - sidebarW, h: sh - topRows}
 }
 
 func (a *app) ensurePaneScroll() {
@@ -1004,7 +1610,46 @@ func shouldEnableStats() bool {
 	}
 }
 
+func (p *pane) updateCommandTracker(k *tcell.EventKey) {
+	if p == nil || k == nil {
+		return
+	}
+
+	switch k.Key() {
+	case tcell.KeyRune:
+		if k.Modifiers()&(tcell.ModCtrl|tcell.ModAlt|tcell.ModMeta) != 0 {
+			return
+		}
+		r := k.Rune()
+		if r >= 32 {
+			p.inputLine = append(p.inputLine, r)
+		}
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		if len(p.inputLine) > 0 {
+			p.inputLine = p.inputLine[:len(p.inputLine)-1]
+		}
+	case tcell.KeyCtrlU:
+		p.inputLine = p.inputLine[:0]
+	case tcell.KeyCtrlW:
+		for len(p.inputLine) > 0 && p.inputLine[len(p.inputLine)-1] == ' ' {
+			p.inputLine = p.inputLine[:len(p.inputLine)-1]
+		}
+		for len(p.inputLine) > 0 && p.inputLine[len(p.inputLine)-1] != ' ' {
+			p.inputLine = p.inputLine[:len(p.inputLine)-1]
+		}
+	case tcell.KeyCtrlC:
+		p.inputLine = p.inputLine[:0]
+	case tcell.KeyEnter:
+		line := strings.TrimSpace(string(p.inputLine))
+		if cmd := commandFromInputLine(line); cmd != "" {
+			p.lastCmd = cmd
+		}
+		p.inputLine = p.inputLine[:0]
+	}
+}
+
 func (p *pane) writeKey(k *tcell.EventKey) {
+	p.updateCommandTracker(k)
 	if encoded, ok := p.encodeKeyGhostty(k); ok {
 		p.writeInput(encoded)
 		return

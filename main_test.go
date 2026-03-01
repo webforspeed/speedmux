@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
 	"testing"
 
@@ -198,6 +200,255 @@ func TestNodeLayout_HorizontalThenVerticalGeometry(t *testing.T) {
 	}
 	if got, want := bounds.y+topLeft.h, bottom.y; got != want {
 		t.Fatalf("bottom pane y: got %d want %d", got, want)
+	}
+}
+
+func TestSidebarVisibleItems(t *testing.T) {
+	tests := []struct {
+		name       string
+		innerH     int
+		totalPanes int
+		cardH      int
+		want       int
+	}{
+		{name: "no room", innerH: 0, totalPanes: 5, cardH: 5, want: 0},
+		{name: "no panes", innerH: 20, totalPanes: 0, cardH: 5, want: 0},
+		{name: "fits all panes", innerH: 20, totalPanes: 3, cardH: 5, want: 3},
+		{name: "exactly full with overflow reserves one card", innerH: 20, totalPanes: 9, cardH: 5, want: 3},
+		{name: "overflow with spare line keeps max cards", innerH: 21, totalPanes: 9, cardH: 5, want: 4},
+		{name: "invalid card height", innerH: 20, totalPanes: 2, cardH: 0, want: 0},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sidebarVisibleItems(tc.innerH, tc.totalPanes, tc.cardH); got != tc.want {
+				t.Fatalf("sidebarVisibleItems(%d, %d, %d): got %d want %d", tc.innerH, tc.totalPanes, tc.cardH, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPaneRegion_AccountsForSidebarAndTopBar(t *testing.T) {
+	a := &app{statsEnabled: true}
+
+	sw, sh := 120, 40
+	sidebarW := a.sidebarWidth(sw)
+	if sidebarW <= 0 {
+		t.Fatalf("expected sidebar width > 0, got %d", sidebarW)
+	}
+
+	sidebar := a.sidebarRegion(sw, sh)
+	if got, want := sidebar.w, sidebarW; got != want {
+		t.Fatalf("sidebar width: got %d want %d", got, want)
+	}
+	if got, want := sidebar.y, a.topBarRows(); got != want {
+		t.Fatalf("sidebar y: got %d want %d", got, want)
+	}
+
+	panes := a.paneRegion(sw, sh)
+	if got, want := panes.x, sidebarW; got != want {
+		t.Fatalf("pane region x: got %d want %d", got, want)
+	}
+	if got, want := panes.y, a.topBarRows(); got != want {
+		t.Fatalf("pane region y: got %d want %d", got, want)
+	}
+	if got, want := panes.w+sidebar.w, sw; got != want {
+		t.Fatalf("total width mismatch: got %d want %d", got, want)
+	}
+	if got, want := panes.h, sh-a.topBarRows(); got != want {
+		t.Fatalf("pane region height: got %d want %d", got, want)
+	}
+}
+
+func TestPaneSummaries_ReflectTreeAndCloseLifecycle(t *testing.T) {
+	root := leaf(1)
+	root.split(splitVertical, &pane{id: 2})
+	a := &app{
+		root:       root,
+		active:     root.first,
+		paneScroll: map[int]int{1: 3, 2: 7},
+	}
+
+	summaries := a.paneSummaries()
+	if got, want := len(summaries), 2; got != want {
+		t.Fatalf("pane summary count: got %d want %d", got, want)
+	}
+	if got, want := summaries[0].id, 1; got != want {
+		t.Fatalf("first pane id: got %d want %d", got, want)
+	}
+	if got, want := summaries[0].cmd, "-"; got != want {
+		t.Fatalf("first pane cmd: got %q want %q", got, want)
+	}
+	if got, want := summaries[0].cwd, "-"; got != want {
+		t.Fatalf("first pane cwd: got %q want %q", got, want)
+	}
+	if got, want := summaries[0].cpu, "-"; got != want {
+		t.Fatalf("first pane cpu: got %q want %q", got, want)
+	}
+	if got, want := summaries[0].state, "n/a"; got != want {
+		t.Fatalf("first pane state: got %q want %q", got, want)
+	}
+	if got, want := summaries[1].id, 2; got != want {
+		t.Fatalf("second pane id: got %d want %d", got, want)
+	}
+	if got, want := summaries[1].cmd, "-"; got != want {
+		t.Fatalf("second pane cmd: got %q want %q", got, want)
+	}
+	if got, want := summaries[1].cwd, "-"; got != want {
+		t.Fatalf("second pane cwd: got %q want %q", got, want)
+	}
+
+	a.active = root.second
+	a.closeActivePane()
+
+	summaries = a.paneSummaries()
+	if got, want := len(summaries), 1; got != want {
+		t.Fatalf("pane summary count after close: got %d want %d", got, want)
+	}
+	if got, want := summaries[0].id, 1; got != want {
+		t.Fatalf("remaining pane id: got %d want %d", got, want)
+	}
+	if _, ok := a.paneScroll[2]; ok {
+		t.Fatal("expected closed pane scroll state to be removed")
+	}
+}
+
+func TestPaneMetadata_CommandAndCwdFallbacks(t *testing.T) {
+	p := &pane{
+		cmd:      &exec.Cmd{Path: "/bin/zsh", Dir: "/tmp/cmd-dir"},
+		startDir: "/tmp/start-dir",
+	}
+
+	if got, want := p.commandName(), "zsh"; got != want {
+		t.Fatalf("commandName: got %q want %q", got, want)
+	}
+	if got, want := p.cwd(), "/tmp/start-dir"; got != want {
+		t.Fatalf("cwd fallback: got %q want %q", got, want)
+	}
+
+	p.startDir = ""
+	if got, want := p.cwd(), "/tmp/cmd-dir"; got != want {
+		t.Fatalf("cwd from cmd.Dir: got %q want %q", got, want)
+	}
+}
+
+func TestParseProcessLine(t *testing.T) {
+	line := " 123  45  7.5  0.2  8192 S 00:03:10 /bin/cat"
+	got, ok := parseProcessLine(line)
+	if !ok {
+		t.Fatal("expected parseProcessLine to parse valid ps line")
+	}
+	if got.pid != 123 || got.ppid != 45 {
+		t.Fatalf("pid/ppid mismatch: %+v", got)
+	}
+	if got.pcpu != 7.5 || got.pmem != 0.2 {
+		t.Fatalf("cpu/mem mismatch: %+v", got)
+	}
+	if got.rssKB != 8192 {
+		t.Fatalf("rss mismatch: got %d want 8192", got.rssKB)
+	}
+	if got.state != "S" || got.elapsed != "00:03:10" {
+		t.Fatalf("state/elapsed mismatch: %+v", got)
+	}
+	if got.command != "/bin/cat" {
+		t.Fatalf("command mismatch: got %q want %q", got.command, "/bin/cat")
+	}
+}
+
+func TestProcessForPane_PrefersNonShellDescendant(t *testing.T) {
+	p := &pane{cmd: &exec.Cmd{Path: "/bin/zsh", Process: &os.Process{Pid: 100}}}
+	a := &app{
+		procSnapshot: processSnapshot{
+			byPID: map[int]processInfo{
+				100: {pid: 100, ppid: 1, state: "S", command: "/bin/zsh"},
+				130: {pid: 130, ppid: 100, state: "R", command: "/bin/cat"},
+			},
+			children: map[int][]int{
+				100: {130},
+			},
+		},
+	}
+
+	got, ok := a.processForPane(p)
+	if !ok {
+		t.Fatal("expected processForPane to find pane process")
+	}
+	if got.pid != 130 {
+		t.Fatalf("expected child process pid 130, got %d", got.pid)
+	}
+}
+
+func TestPaneSummaries_PersistsLastObservedCommand(t *testing.T) {
+	p := &pane{
+		id:       1,
+		cmd:      &exec.Cmd{Path: "/bin/zsh", Process: &os.Process{Pid: 100}},
+		startDir: "/tmp",
+	}
+	root := &node{pane: p}
+	a := &app{
+		root: root,
+		procSnapshot: processSnapshot{
+			byPID: map[int]processInfo{
+				100: {pid: 100, ppid: 1, state: "S", command: "/bin/zsh"},
+				150: {pid: 150, ppid: 100, state: "R", command: "/bin/cat"},
+			},
+			children: map[int][]int{
+				100: {150},
+			},
+		},
+	}
+
+	summaries := a.paneSummaries()
+	if got, want := summaries[0].cmd, "cat"; got != want {
+		t.Fatalf("fallback command mismatch: got %q want %q", got, want)
+	}
+
+	p.lastCmd = "git"
+	summaries = a.paneSummaries()
+	if got, want := summaries[0].cmd, "git"; got != want {
+		t.Fatalf("expected typed command to win over process fallback: got %q want %q", got, want)
+	}
+}
+
+func TestCommandFromInputLine(t *testing.T) {
+	tests := []struct {
+		line string
+		want string
+	}{
+		{line: "cat file.txt", want: "cat"},
+		{line: "FOO=1 BAR=2 /bin/ls -la", want: "ls"},
+		{line: "sudo cat /tmp/x", want: "cat"},
+		{line: "echo hi | grep h", want: "echo"},
+		{line: "   # comment", want: ""},
+		{line: "PATH=/tmp", want: ""},
+	}
+
+	for _, tc := range tests {
+		if got := commandFromInputLine(tc.line); got != tc.want {
+			t.Fatalf("commandFromInputLine(%q): got %q want %q", tc.line, got, tc.want)
+		}
+	}
+}
+
+func TestUpdateCommandTracker_CapturesEnteredCommand(t *testing.T) {
+	p := &pane{}
+	for _, r := range "cat file.txt" {
+		p.updateCommandTracker(tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone))
+	}
+	p.updateCommandTracker(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	if got, want := p.lastCmd, "cat"; got != want {
+		t.Fatalf("lastCmd after enter: got %q want %q", got, want)
+	}
+
+	for _, r := range "bad" {
+		p.updateCommandTracker(tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone))
+	}
+	p.updateCommandTracker(tcell.NewEventKey(tcell.KeyBackspace2, 0, tcell.ModNone))
+	p.updateCommandTracker(tcell.NewEventKey(tcell.KeyCtrlC, 0, tcell.ModNone))
+	p.updateCommandTracker(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	if got, want := p.lastCmd, "cat"; got != want {
+		t.Fatalf("lastCmd should remain unchanged after canceled line: got %q want %q", got, want)
 	}
 }
 
