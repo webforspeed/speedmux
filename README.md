@@ -8,6 +8,21 @@ A simple terminal multiplexer written in Go and libghostty.
 - Cycle focus between panes
 - Optional `libghostty-vt` rendering backend (enabled by default)
 
+## Install / Deploy
+Build and install the binary into your local bin so every terminal can run it:
+
+```bash
+make deploy
+```
+
+By default this installs `speedmux` to `~/.local/bin/speedmux`.
+
+If `~/.local/bin` is not already on your `PATH`, add this to your shell config (`~/.zshrc`, `~/.bashrc`, etc.):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Run
 ```bash
 go run .
