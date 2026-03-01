@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -334,6 +335,11 @@ func TestPaneMetadata_CommandAndCwdFallbacks(t *testing.T) {
 	if got, want := p.cwd(), "/tmp/cmd-dir"; got != want {
 		t.Fatalf("cwd from cmd.Dir: got %q want %q", got, want)
 	}
+
+	p.trackedDir = "/tmp/live-dir"
+	if got, want := p.cwd(), "/tmp/live-dir"; got != want {
+		t.Fatalf("cwd from trackedDir: got %q want %q", got, want)
+	}
 }
 
 func TestParseProcessLine(t *testing.T) {
@@ -452,6 +458,52 @@ func TestUpdateCommandTracker_CapturesEnteredCommand(t *testing.T) {
 	p.updateCommandTracker(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
 	if got, want := p.lastCmd, "cat"; got != want {
 		t.Fatalf("lastCmd should remain unchanged after canceled line: got %q want %q", got, want)
+	}
+}
+
+func TestUpdateCommandTracker_TracksDirectoryFromCD(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	base := filepath.Join(tmp, "base")
+	sub := filepath.Join(base, "sub")
+	homeSub := filepath.Join(home, "projects")
+	for _, dir := range []string{home, base, sub, homeSub} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %q: %v", dir, err)
+		}
+	}
+	t.Setenv("HOME", home)
+
+	p := &pane{startDir: base, trackedDir: base}
+	enterLine := func(line string) {
+		p.inputLine = []rune(line)
+		p.updateCommandTracker(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	}
+
+	enterLine("cd sub")
+	if got, want := p.cwd(), sub; got != want {
+		t.Fatalf("cwd after relative cd: got %q want %q", got, want)
+	}
+	if got, want := p.prevDir, base; got != want {
+		t.Fatalf("prevDir after relative cd: got %q want %q", got, want)
+	}
+
+	enterLine("cd -")
+	if got, want := p.cwd(), base; got != want {
+		t.Fatalf("cwd after cd -: got %q want %q", got, want)
+	}
+	if got, want := p.prevDir, sub; got != want {
+		t.Fatalf("prevDir after cd -: got %q want %q", got, want)
+	}
+
+	enterLine("cd ~/projects")
+	if got, want := p.cwd(), homeSub; got != want {
+		t.Fatalf("cwd after cd ~/projects: got %q want %q", got, want)
+	}
+
+	enterLine("cd does-not-exist")
+	if got, want := p.cwd(), homeSub; got != want {
+		t.Fatalf("invalid cd should not change cwd: got %q want %q", got, want)
 	}
 }
 

@@ -51,6 +51,8 @@ type pane struct {
 	pty         *os.File
 	ghosttyTerm *libghostty.Terminal
 	startDir    string
+	trackedDir  string
+	prevDir     string
 	lastCmd     string
 	inputLine   []rune
 	mu          sync.Mutex
@@ -81,7 +83,14 @@ func newPane(id int, redraw func(), ghosttyRuntime *libghostty.Runtime, onOutput
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 
-	p := &pane{id: id, cmd: cmd, pty: ptmx, startDir: startDir, lines: make([]string, 0, 128), onOutput: onOutput}
+	p := &pane{
+		id:       id,
+		cmd:      cmd,
+		pty:      ptmx,
+		startDir: startDir,
+		lines:    make([]string, 0, 128),
+		onOutput: onOutput,
+	}
 	if ghosttyRuntime != nil {
 		term, err := ghosttyRuntime.NewTerminal(context.Background(), 80, 24, maxScrollbackLines)
 		if err == nil {
@@ -342,6 +351,9 @@ func (p *pane) cwd() string {
 	if p == nil {
 		return "-"
 	}
+	if cwd := strings.TrimSpace(p.trackedDir); cwd != "" {
+		return cwd
+	}
 	if p.ghosttyTerm != nil {
 		if pwd := strings.TrimSpace(p.ghosttyTerm.GetPwd(context.Background())); pwd != "" {
 			return pwd
@@ -387,37 +399,7 @@ func isIgnoredHelperCommand(name string) bool {
 }
 
 func commandFromInputLine(line string) string {
-	tokens := tokenizeInputLine(line)
-	if len(tokens) == 0 {
-		return ""
-	}
-
-	for len(tokens) > 0 {
-		tok := tokens[0]
-		if envAssignPattern.MatchString(tok) {
-			tokens = tokens[1:]
-			continue
-		}
-		break
-	}
-	if len(tokens) == 0 {
-		return ""
-	}
-
-	// Peel common wrappers and their flags.
-	for len(tokens) > 0 {
-		switch tokens[0] {
-		case "sudo", "env", "command", "builtin", "nohup", "time", "exec":
-			tokens = tokens[1:]
-			for len(tokens) > 0 && strings.HasPrefix(tokens[0], "-") {
-				tokens = tokens[1:]
-			}
-		default:
-			goto done
-		}
-	}
-
-done:
+	tokens := trackedCommandTokens(line)
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -479,6 +461,135 @@ func tokenizeInputLine(line string) []string {
 	}
 	flush()
 	return tokens
+}
+
+func trackedCommandTokens(line string) []string {
+	tokens := tokenizeInputLine(line)
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	for len(tokens) > 0 && envAssignPattern.MatchString(tokens[0]) {
+		tokens = tokens[1:]
+	}
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Peel common wrappers and their flags.
+	for len(tokens) > 0 {
+		switch tokens[0] {
+		case "sudo", "env", "command", "builtin", "nohup", "time", "exec":
+			tokens = tokens[1:]
+			for len(tokens) > 0 && strings.HasPrefix(tokens[0], "-") {
+				tokens = tokens[1:]
+			}
+		default:
+			return tokens
+		}
+	}
+	return nil
+}
+
+func cdTargetFromInputLine(line string) (target string, isCD bool, ok bool) {
+	tokens := trackedCommandTokens(line)
+	if len(tokens) == 0 || tokens[0] != "cd" {
+		return "", false, false
+	}
+
+	args := tokens[1:]
+	if len(args) == 0 {
+		return "", true, true
+	}
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		if arg == "--" {
+			i++
+			break
+		}
+		if arg == "-" {
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			i++
+			continue
+		}
+		break
+	}
+
+	if i >= len(args) {
+		return "", true, true
+	}
+	if i+1 < len(args) {
+		return "", true, false
+	}
+	return args[i], true, true
+}
+
+func resolveCDTarget(target, currentDir, prevDir string) (string, bool) {
+	homeDir, _ := os.UserHomeDir()
+	switch target {
+	case "", "~":
+		if homeDir == "" {
+			return "", false
+		}
+		return filepath.Clean(homeDir), true
+	case "-":
+		if prevDir == "" {
+			return "", false
+		}
+		return filepath.Clean(prevDir), true
+	}
+
+	if strings.HasPrefix(target, "~/") {
+		if homeDir == "" {
+			return "", false
+		}
+		return filepath.Clean(filepath.Join(homeDir, strings.TrimPrefix(target, "~/"))), true
+	}
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target), true
+	}
+	if currentDir == "" {
+		return "", false
+	}
+	return filepath.Clean(filepath.Join(currentDir, target)), true
+}
+
+func isExistingDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func (p *pane) updateTrackedDirFromInput(line string) {
+	if p == nil {
+		return
+	}
+
+	target, isCD, ok := cdTargetFromInputLine(line)
+	if !isCD || !ok {
+		return
+	}
+
+	currentDir := strings.TrimSpace(p.trackedDir)
+	if currentDir == "" {
+		currentDir = strings.TrimSpace(p.startDir)
+	}
+	if currentDir == "" && p.cmd != nil {
+		currentDir = strings.TrimSpace(p.cmd.Dir)
+	}
+
+	nextDir, ok := resolveCDTarget(target, currentDir, strings.TrimSpace(p.prevDir))
+	if !ok || !isExistingDir(nextDir) {
+		return
+	}
+
+	if nextDir != currentDir && currentDir != "" {
+		p.prevDir = currentDir
+	}
+	p.trackedDir = nextDir
 }
 
 func parseProcessLine(line string) (processInfo, bool) {
@@ -1689,6 +1800,7 @@ func (p *pane) updateCommandTracker(k *tcell.EventKey) {
 		if cmd := commandFromInputLine(line); cmd != "" {
 			p.lastCmd = cmd
 		}
+		p.updateTrackedDirFromInput(line)
 		p.inputLine = p.inputLine[:0]
 	}
 }
