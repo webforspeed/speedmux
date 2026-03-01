@@ -11,20 +11,38 @@ A simple terminal multiplexer written in Go and libghostty.
 - Cycle focus between panes
 - Optional `libghostty-vt` rendering backend (enabled by default)
 
-## Install / Deploy
-Build and install the binary into your local bin so every terminal can run it:
+## Install (GitHub Releases)
+Install the latest release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/webforspeed/speedmux/main/install | bash
+```
+This installs `speedmux` to `~/.local/bin/speedmux`.
+
+## Local Install / Deploy
+Build and install from source:
 
 ```bash
 make deploy
 ```
 
-By default this installs `speedmux` to `~/.local/bin/speedmux`.
-
-If `~/.local/bin` is not already on your `PATH`, add this to your shell config (`~/.zshrc`, `~/.bashrc`, etc.):
+By default this installs `speedmux` to `~/.local/bin/speedmux`. If `~/.local/bin` is not on your `PATH`, add this to your shell config (`~/.zshrc`, `~/.bashrc`, etc.):
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+## Publishing Releases
+Tag pushes matching `v*` trigger `.github/workflows/release.yml`.
+
+Example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Maintenance and release runbooks are documented in `MAINTENANCE.md`.
 
 ## Run
 ```bash
@@ -47,3 +65,4 @@ go run .
 - Each new pane launches your `$SHELL` (falls back to `/bin/sh`).
 - `MULTIPLEXER_GHOSTTY_VT=0 go run .` disables the ghostty-vt backend and uses the basic line renderer.
 - `STATS=ON go run .` enables a debug stats row under the help bar (FPS, panes/splits, events, output line counts, and render cell totals).
+- Set `SPEEDMUX_DISABLE_UPDATE_CHECK=1` to skip the update check.

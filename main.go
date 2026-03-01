@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,7 +30,16 @@ const (
 	sidebarCardHeight  = 5
 	sidebarCardGap     = 1
 	processPollEvery   = 400 * time.Millisecond
+	updateCheckTimeout = 3 * time.Second
 )
+
+const (
+	releaseRepo = "webforspeed/speedmux"
+)
+
+// version is set at build time via:
+//   -ldflags "-X main.version=v0.1.0"
+var version = "dev"
 
 type splitOrientation int
 
@@ -881,6 +892,9 @@ type app struct {
 	mouseEvents    uint64
 	resizeEvents   uint64
 	outputLines    uint64
+	updateCh       chan string
+	updateBanner   string
+	versionLabel   string
 }
 
 type paneOutput struct {
@@ -930,10 +944,12 @@ func newApp() (*app, error) {
 	a := &app{
 		screen:       s,
 		redrawCh:     make(chan struct{}, 1),
+		updateCh:     make(chan string, 1),
 		nextID:       1,
 		paneScroll:   map[int]int{},
 		outputCh:     make(chan paneOutput, 256),
 		statsEnabled: shouldEnableStats(),
+		versionLabel: displayVersion(version),
 	}
 	if shouldEnableGhosttyVT() {
 		rt, err := libghostty.NewRuntime(context.Background())
@@ -958,6 +974,7 @@ func newApp() (*app, error) {
 	a.root = leaf
 	a.active = leaf
 	a.paneScroll[firstPane.id] = 0
+	a.startUpdateCheck()
 	return a, nil
 }
 
@@ -1007,6 +1024,9 @@ func (a *app) run() {
 			a.render()
 		case out := <-a.outputCh:
 			a.handlePaneOutput(out)
+		case msg := <-a.updateCh:
+			a.updateBanner = msg
+			a.render()
 		}
 	}
 }
@@ -1285,7 +1305,7 @@ func (a *app) render() {
 		return
 	}
 
-	help := "speedmux - by webforspeed | Alt+v split vertical | Alt+h split horizontal | Alt+w close pane | Alt+n next pane | Alt+p prev pane | Shift+PgUp/PgDn scroll | Alt+q quit"
+	help := a.helpLine()
 	drawText(a.screen, 0, 0, sw, help, style.Foreground(tcell.ColorAqua))
 
 	topRows := a.topBarRows()
@@ -1318,6 +1338,124 @@ func (a *app) render() {
 	})
 
 	a.screen.Show()
+}
+
+func (a *app) helpLine() string {
+	head := fmt.Sprintf("speedmux %s - by webforspeed", a.versionLabel)
+	if a.updateBanner != "" {
+		head += " | " + a.updateBanner
+	}
+	return head + " | Alt+v split vertical | Alt+h split horizontal | Alt+w close pane | Alt+n next pane | Alt+p prev pane | Shift+PgUp/PgDn scroll | Alt+q quit"
+}
+
+func (a *app) startUpdateCheck() {
+	if os.Getenv("SPEEDMUX_DISABLE_UPDATE_CHECK") == "1" {
+		return
+	}
+	if a.versionLabel == "dev" {
+		return
+	}
+
+	go func(current string) {
+		latest, err := fetchLatestReleaseTag(updateCheckTimeout)
+		if err != nil || latest == "" {
+			return
+		}
+		if isNewerVersion(latest, current) {
+			msg := fmt.Sprintf("new version available: %s (rerun install command)", latest)
+			select {
+			case a.updateCh <- msg:
+			default:
+			}
+		}
+	}(a.versionLabel)
+}
+
+func displayVersion(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return "dev"
+	}
+	return trimmed
+}
+
+func fetchLatestReleaseTag(timeout time.Duration) (string, error) {
+	type latestRelease struct {
+		TagName string `json:"tag_name"`
+	}
+
+	client := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/"+releaseRepo+"/releases/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "speedmux-update-check")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	var payload latestRelease
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(payload.TagName), nil
+}
+
+func isNewerVersion(candidate, current string) bool {
+	cMaj, cMin, cPatch, ok := parseSemver(candidate)
+	if !ok {
+		return false
+	}
+	vMaj, vMin, vPatch, ok := parseSemver(current)
+	if !ok {
+		return false
+	}
+
+	if cMaj != vMaj {
+		return cMaj > vMaj
+	}
+	if cMin != vMin {
+		return cMin > vMin
+	}
+	return cPatch > vPatch
+}
+
+func parseSemver(v string) (major, minor, patch int, ok bool) {
+	s := strings.TrimSpace(v)
+	s = strings.TrimPrefix(s, "v")
+	if s == "" {
+		return 0, 0, 0, false
+	}
+
+	parts := strings.SplitN(s, "-", 2)
+	core := parts[0]
+	seg := strings.Split(core, ".")
+	if len(seg) != 3 {
+		return 0, 0, 0, false
+	}
+
+	maj, err := strconv.Atoi(seg[0])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	min, err := strconv.Atoi(seg[1])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	pat, err := strconv.Atoi(seg[2])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	return maj, min, pat, true
 }
 
 func (a *app) drawPane(n *node, r rect) {
