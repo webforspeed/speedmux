@@ -2,6 +2,9 @@
 
 A simple terminal multiplexer written in Go and libghostty.
 
+## Screenshot
+![speedmux screenshot](assets/screnshot.png)
+
 ## Features
 - Multiple independent terminal sessions (one shell per pane)
 - Split active pane vertically or horizontally

@@ -924,3 +924,54 @@ func TestTruncateRunes(t *testing.T) {
 		t.Fatalf("truncate runes: got %q want %q", got, want)
 	}
 }
+
+func TestDrawANSIText_AppliesColorAndReset(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatalf("init simulation screen: %v", err)
+	}
+	defer screen.Fini()
+	screen.SetSize(4, 1)
+
+	base := tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorBlack)
+	drawANSIText(screen, 0, 0, 4, "\x1b[31mR\x1b[0mX", base)
+
+	ch0, _, style0, _ := screen.GetContent(0, 0)
+	if got, want := ch0, 'R'; got != want {
+		t.Fatalf("first rune: got %q want %q", got, want)
+	}
+	fg0, _, _ := style0.Decompose()
+	if got, want := fg0, tcell.ColorMaroon; got != want {
+		t.Fatalf("first rune fg: got %v want %v", got, want)
+	}
+
+	ch1, _, style1, _ := screen.GetContent(1, 0)
+	if got, want := ch1, 'X'; got != want {
+		t.Fatalf("second rune: got %q want %q", got, want)
+	}
+	fg1, _, _ := style1.Decompose()
+	if got, want := fg1, tcell.ColorWhite; got != want {
+		t.Fatalf("second rune fg after reset: got %v want %v", got, want)
+	}
+}
+
+func TestDrawANSIText_Parses256Color(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatalf("init simulation screen: %v", err)
+	}
+	defer screen.Fini()
+	screen.SetSize(2, 1)
+
+	base := tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorBlack)
+	drawANSIText(screen, 0, 0, 2, "\x1b[38;5;196mZ", base)
+
+	ch, _, style, _ := screen.GetContent(0, 0)
+	if got, want := ch, 'Z'; got != want {
+		t.Fatalf("rune: got %q want %q", got, want)
+	}
+	fg, _, _ := style.Decompose()
+	if got, want := fg, tcell.PaletteColor(196); got != want {
+		t.Fatalf("256-color fg: got %v want %v", got, want)
+	}
+}

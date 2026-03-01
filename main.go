@@ -218,7 +218,7 @@ func (p *pane) visibleLinesWithScroll(width, height, scroll int) ([]string, int)
 }
 
 func (p *pane) visibleLinesGhostty(width, height, scroll int) ([]string, int) {
-	dump, err := p.ghosttyTerm.DumpScreen(context.Background(), libghostty.DumpPlain|libghostty.DumpFlagUnwrap|libghostty.DumpFlagScrollback)
+	dump, err := p.ghosttyTerm.DumpScreen(context.Background(), libghostty.DumpVTSafe|libghostty.DumpFlagUnwrap|libghostty.DumpFlagScrollback)
 	if err != nil {
 		return []string{truncateRunes("[ghostty-vt dump error]", width)}, 0
 	}
@@ -227,7 +227,7 @@ func (p *pane) visibleLinesGhostty(width, height, scroll int) ([]string, int) {
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")
 	lines := strings.Split(normalized, "\n")
 
-	return windowLines(lines, width, height, scroll)
+	return windowLinesNoTruncate(lines, height, scroll)
 }
 
 func windowLines(all []string, width, height, scroll int) ([]string, int) {
@@ -257,6 +257,36 @@ func windowLines(all []string, width, height, scroll int) ([]string, int) {
 	for i := range out {
 		out[i] = truncateRunes(out[i], width)
 	}
+	return out, scroll
+}
+
+func windowLinesNoTruncate(all []string, height, scroll int) ([]string, int) {
+	if height <= 0 {
+		return nil, 0
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+
+	maxScroll := 0
+	if len(all) > height {
+		maxScroll = len(all) - height
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+
+	start := len(all) - height - scroll
+	if start < 0 {
+		start = 0
+	}
+	end := start + height
+	if end > len(all) {
+		end = len(all)
+	}
+
+	out := make([]string, end-start)
+	copy(out, all[start:end])
 	return out, scroll
 }
 
@@ -1211,7 +1241,7 @@ func (a *app) drawPane(n *node, r rect) {
 		if i < len(lines) {
 			line = lines[i]
 		}
-		drawText(a.screen, r.x+1, y, innerW, line, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+		drawANSIText(a.screen, r.x+1, y, innerW, line, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 	}
 }
 
@@ -1842,6 +1872,272 @@ func drawText(s tcell.Screen, x, y, width int, text string, style tcell.Style) {
 			ch = runes[i]
 		}
 		s.SetContent(x+i, y, ch, nil, style)
+	}
+}
+
+type ansiMode uint8
+
+const (
+	ansiModeText ansiMode = iota
+	ansiModeEsc
+	ansiModeCSI
+	ansiModeOSC
+	ansiModeOSCEscape
+)
+
+type ansiStyleState struct {
+	base      tcell.Style
+	fgSet     bool
+	bgSet     bool
+	fg        tcell.Color
+	bg        tcell.Color
+	bold      bool
+	underline bool
+	reverse   bool
+}
+
+func (s ansiStyleState) style() tcell.Style {
+	out := s.base
+	if s.fgSet {
+		out = out.Foreground(s.fg)
+	}
+	if s.bgSet {
+		out = out.Background(s.bg)
+	}
+	out = out.Bold(s.bold).Underline(s.underline).Reverse(s.reverse)
+	return out
+}
+
+func (s *ansiStyleState) applySGR(params string) {
+	fields := strings.Split(params, ";")
+	if len(fields) == 1 && fields[0] == "" {
+		fields = []string{"0"}
+	}
+
+	for i := 0; i < len(fields); i++ {
+		val := parseSGRField(fields[i], 0)
+		switch {
+		case val == 0:
+			s.fgSet = false
+			s.bgSet = false
+			s.bold = false
+			s.underline = false
+			s.reverse = false
+		case val == 1:
+			s.bold = true
+		case val == 4:
+			s.underline = true
+		case val == 7:
+			s.reverse = true
+		case val == 22:
+			s.bold = false
+		case val == 24:
+			s.underline = false
+		case val == 27:
+			s.reverse = false
+		case val == 39:
+			s.fgSet = false
+		case val == 49:
+			s.bgSet = false
+		case val >= 30 && val <= 37:
+			s.fg = ansiBaseColor(val - 30)
+			s.fgSet = true
+		case val >= 90 && val <= 97:
+			s.fg = ansiBrightColor(val - 90)
+			s.fgSet = true
+		case val >= 40 && val <= 47:
+			s.bg = ansiBaseColor(val - 40)
+			s.bgSet = true
+		case val >= 100 && val <= 107:
+			s.bg = ansiBrightColor(val - 100)
+			s.bgSet = true
+		case val == 38 || val == 48:
+			isForeground := val == 38
+			if i+1 >= len(fields) {
+				continue
+			}
+			mode := parseSGRField(fields[i+1], -1)
+			switch mode {
+			case 5:
+				if i+2 >= len(fields) {
+					continue
+				}
+				idx := parseSGRField(fields[i+2], -1)
+				if idx >= 0 && idx <= 255 {
+					if isForeground {
+						s.fg = tcell.PaletteColor(idx)
+						s.fgSet = true
+					} else {
+						s.bg = tcell.PaletteColor(idx)
+						s.bgSet = true
+					}
+				}
+				i += 2
+			case 2:
+				if i+4 >= len(fields) {
+					continue
+				}
+				r := clampColorComponent(parseSGRField(fields[i+2], 0))
+				g := clampColorComponent(parseSGRField(fields[i+3], 0))
+				b := clampColorComponent(parseSGRField(fields[i+4], 0))
+				color := tcell.NewRGBColor(int32(r), int32(g), int32(b))
+				if isForeground {
+					s.fg = color
+					s.fgSet = true
+				} else {
+					s.bg = color
+					s.bgSet = true
+				}
+				i += 4
+			}
+		}
+	}
+}
+
+func parseSGRField(field string, fallback int) int {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(field)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func clampColorComponent(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
+}
+
+func ansiBaseColor(idx int) tcell.Color {
+	switch idx {
+	case 0:
+		return tcell.ColorBlack
+	case 1:
+		return tcell.ColorMaroon
+	case 2:
+		return tcell.ColorGreen
+	case 3:
+		return tcell.ColorOlive
+	case 4:
+		return tcell.ColorNavy
+	case 5:
+		return tcell.ColorPurple
+	case 6:
+		return tcell.ColorTeal
+	default:
+		return tcell.ColorSilver
+	}
+}
+
+func ansiBrightColor(idx int) tcell.Color {
+	switch idx {
+	case 0:
+		return tcell.ColorGray
+	case 1:
+		return tcell.ColorRed
+	case 2:
+		return tcell.ColorLime
+	case 3:
+		return tcell.ColorYellow
+	case 4:
+		return tcell.ColorBlue
+	case 5:
+		return tcell.ColorFuchsia
+	case 6:
+		return tcell.ColorAqua
+	default:
+		return tcell.ColorWhite
+	}
+}
+
+func drawANSIText(s tcell.Screen, x, y, width int, text string, base tcell.Style) {
+	if width <= 0 {
+		return
+	}
+
+	// Fill background area first so short lines and hidden escape bytes don't leak stale cells.
+	for i := 0; i < width; i++ {
+		s.SetContent(x+i, y, ' ', nil, base)
+	}
+
+	styleState := ansiStyleState{base: base}
+	mode := ansiModeText
+	csi := make([]byte, 0, 24)
+	col := 0
+
+	for i := 0; i < len(text) && col < width; {
+		b := text[i]
+		switch mode {
+		case ansiModeEsc:
+			switch b {
+			case '[':
+				mode = ansiModeCSI
+				csi = csi[:0]
+			case ']':
+				mode = ansiModeOSC
+			default:
+				mode = ansiModeText
+			}
+			i++
+			continue
+		case ansiModeCSI:
+			i++
+			if b >= 0x40 && b <= 0x7E {
+				if b == 'm' {
+					styleState.applySGR(string(csi))
+				}
+				mode = ansiModeText
+				continue
+			}
+			if len(csi) < 96 {
+				csi = append(csi, b)
+			}
+			continue
+		case ansiModeOSC:
+			i++
+			if b == 0x07 {
+				mode = ansiModeText
+			} else if b == 0x1b {
+				mode = ansiModeOSCEscape
+			}
+			continue
+		case ansiModeOSCEscape:
+			i++
+			if b == '\\' {
+				mode = ansiModeText
+			} else {
+				mode = ansiModeOSC
+			}
+			continue
+		}
+
+		if b == 0x1b {
+			mode = ansiModeEsc
+			i++
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		i += size
+
+		if r == 0 || r < 32 {
+			continue
+		}
+
+		s.SetContent(x+col, y, r, nil, styleState.style())
+		col++
 	}
 }
 
