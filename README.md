@@ -38,8 +38,7 @@ Tag pushes matching `v*` trigger `.github/workflows/release.yml`.
 Example:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+make release TAG=v0.1.0
 ```
 
 Maintenance and release runbooks are documented in `MAINTENANCE.md`.
